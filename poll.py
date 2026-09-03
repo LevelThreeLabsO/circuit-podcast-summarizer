@@ -1243,7 +1243,12 @@ def main():
 
     slack = Slack()
     if not slack.token or not slack.channel:
-        sys.exit("Missing SLACK_BOT_TOKEN or SLACK_CHANNEL_ID.")
+        # Clean no-op rather than a hard error. The Circuit's Slack app lives in
+        # a different workspace than JI's, so the repo exists (and the */5
+        # schedule fires) before those two secrets are filled in. Exiting 0
+        # keeps the Actions tab green instead of failing every five minutes.
+        print("SLACK_BOT_TOKEN / SLACK_CHANNEL_ID not set — nothing to do yet.")
+        return
     bot_user_id = slack.whoami().get("user_id")
 
     state = load_state()
