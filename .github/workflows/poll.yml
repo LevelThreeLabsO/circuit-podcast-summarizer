@@ -1,0 +1,117 @@
+name: Circuit podcast summarizer
+
+on:
+  # Manual trigger still allowed (for one-off dispatches from the Actions tab).
+  workflow_dispatch:
+  # Primary cadence. GH minimum for scheduled workflows is */5. Faster cadence
+  # is not possible with GH's built-in scheduler.
+  schedule:
+    - cron: "*/5 * * * *"
+
+# poll.py commits watcher_state.json back to the repo.
+# actions:write lets the self-chain step re-dispatch the workflow via the
+# built-in GITHUB_TOKEN — no PAT required.
+permissions:
+  contents: write
+  actions: write
+
+# Cadence: */5 schedule + self-chain (added 2026-08-07). Self-chain fires one
+# dispatch at the end of each run for sub-2-min cadence. Safe from the previous
+# storm because (a) cron-job.org's external PAT ping is dead, (b) the
+# concurrency group serializes runs so at most one is running + one queued —
+# self-chain can never stack past that.
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 2
+      - uses: actions/setup-python@v5
+        timeout-minutes: 3
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install ffmpeg (for podcast audio re-encoding)
+        # Direct static binary from BtbN's GitHub-hosted release. Way more
+        # reliable than apt (slow mirrors) or johnvansickle.com (sometimes
+        # returns HTML instead of the tarball). Cached across runs too.
+        timeout-minutes: 2
+        run: |
+          set -e
+          mkdir -p ~/bin
+          curl -sSL --retry 3 --retry-delay 3 --max-time 90 -o /tmp/ffmpeg.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/
+          mv /tmp/ffmpeg-*/bin/ffmpeg /tmp/ffmpeg-*/bin/ffprobe ~/bin/
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          ~/bin/ffmpeg -version | head -1
+      - name: Install deps
+        timeout-minutes: 3
+        run: pip install -r requirements.txt
+      - name: Poll and summarize
+        # Step-level timeout: kills only this step if a poll hangs. Commit,
+        # alert, and chain steps still run afterward so state gets persisted
+        # and the next tick is dispatched. 8 min gives a slow podcast enough
+        # room; anything past that is stuck and worth killing.
+        timeout-minutes: 8
+        run: python3 poll.py
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Groq Whisper for podcast transcription
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Primary YouTube path: cloud-native transcript service (25/day free)
+          YT_TRANSCRIPT_IO_TOKEN: ${{ secrets.YT_TRANSCRIPT_IO_TOKEN }}
+          # Fallback for YouTube (residential IP) when the free quota is
+          # exhausted or the service fails.
+          CLIPMAKER_URL: ${{ secrets.CLIPMAKER_URL }}
+          CLIPMAKER_AUTH_TOKEN: ${{ secrets.CLIPMAKER_AUTH_TOKEN }}
+      - name: Commit updated state
+        # if: always() — even if poll.py raised at the end, save_state() is
+        # atomic and may have committed useful work (messages processed
+        # earlier in the tick) before the exception. Persist what's there.
+        if: always()
+        run: |
+          git config user.name "podcast-summarizer-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add watcher_state.json
+          if git diff --cached --quiet; then
+            echo "no state changes"; exit 0
+          fi
+          git commit -m "Update watcher state [skip ci]"
+          # Retry on a non-fast-forward race (another run or commit moved main).
+          # On a state-file conflict, keep the remote's version (-X ours during
+          # rebase = prefer upstream) so we never roll the watermark backward.
+          for i in 1 2 3 4 5; do
+            if git push; then echo "pushed on try $i"; exit 0; fi
+            echo "push rejected — rebasing onto latest main (try $i)"
+            git pull --rebase -X ours --autostash origin main || git rebase --abort
+          done
+          echo "could not push state after 5 tries"; exit 1
+      - name: Chain next run
+        # Fires one dispatch at the end of every run so cadence tracks run
+        # duration (~1-2 min normally, up to 5 min when Whisper transcribes).
+        # Safe because the concurrency group above serializes runs — extra
+        # dispatches can't overflow past the one queued slot. Uses the built-in
+        # GITHUB_TOKEN (no PAT needed).
+        if: always()
+        timeout-minutes: 1
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --retry 2 --retry-delay 3 \
+            --max-time 10 \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/poll.yml/dispatches" \
+            -d '{"ref":"main"}' || echo "chain dispatch failed — schedule cron will recover"
+          exit 0

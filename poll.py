@@ -1,0 +1,1346 @@
+#!/usr/bin/env python3
+"""Watches a Slack channel for YouTube / podcast / tweet / article URLs and
+posts a Notable Moments threaded reply, tuned to The Circuit's Gulf-business
+beat. Port of LevelThreeLabsO/ji-podcast-summarizer; the beat rubric comes
+from LevelThreeLabsO/circuit-newswire, which derived it by counting 269 of
+The Circuit's own headlines rather than guessing.
+
+Single-shot: one GH Actions tick = one run. State (last-checked timestamp +
+processed message IDs) is committed back to the repo so runs don't re-process.
+
+Usage:
+  python poll.py                # real run (needs all env vars)
+  python poll.py --dry-run      # process + print, don't post to Slack
+  python poll.py --url <URL>    # test a single URL end-to-end (dry-run)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+import requests
+
+STATE_FILE = Path(__file__).resolve().parent / "watcher_state.json"
+
+YOUTUBE_RE = re.compile(
+    r"https?://(?:www\.|m\.)?"
+    r"(?:"
+    #  watch?v=ID   OR   watch?anything&v=ID  (v isn't necessarily first)
+    r"youtube\.com/watch\?(?:[^\s]*?&)?v=|"
+    r"youtu\.be/|"
+    r"youtube\.com/(?:live|shorts|embed)/"
+    r")"
+    r"([A-Za-z0-9_-]{11})"
+)
+PODCAST_RE = re.compile(
+    r"https?://(?:open\.spotify\.com/episode|podcasts\.apple\.com)/[^\s>|]+"
+)
+TWEET_RE = re.compile(
+    r"https?://(?:www\.|mobile\.)?"
+    r"(?:twitter\.com|x\.com)/[^/\s]+/status/(\d+)"
+)
+# Generic http(s) URL — used as a fallback for news articles etc. Comes LAST
+# in dispatch so YT/Twitter/podcast URLs take priority.
+# Generic http(s) URL. We rstrip common trailing punctuation on the match
+# before use since Slack often includes a period/paren from the surrounding
+# sentence in the message text.
+ARTICLE_RE = re.compile(r"https?://[^\s>|<]+")
+_URL_TRAILING_JUNK = ".,!?;:)]\"'"
+
+# ── The Circuit's beat ────────────────────────────────────────────────────────
+# The rubric below is not guesswork. It is the same relevance model as
+# LevelThreeLabsO/circuit-newswire, which was built by counting 269 of The
+# Circuit's own headlines and 300 of their outbound links. The load-bearing
+# rule carried over from there: GEOGRAPHY IS NEVER ENOUGH ON ITS OWN. A Gulf
+# place name plus a war-and-diplomacy moment is not a Circuit story; it needs
+# a commercial, capital, or principal dimension. That single constraint is
+# what keeps the channel from filling with regional politics.
+BEAT_RUBRIC = """The Circuit covers the business of the Gulf and the wider Middle East \
+— capital, deals, the people who move them, and the way regional conflict reprices trade.
+
+A moment is on-beat when it involves at least one of:
+
+  1. A NAMED COMMERCIAL ENTITY. Sovereign wealth and state holding companies (PIF, \
+Mubadala, ADIA, ADQ, QIA, KIA, ICD, Oman Investment Authority, IHC, Alpha Dhabi, Lunate, \
+Sanabil, Alat, Investcorp); tech, AI and space (MGX, G42, Core42, Space42, Presight, \
+Humain, Cerebras); energy (ADNOC, XRG, Aramco, QatarEnergy, Masdar, ACWA Power, TAQA, \
+DEWA, Ma'aden, SABIC, Borouge, Fertiglobe); ports and logistics (DP World, AD Ports, \
+Etihad Rail, Aramex, Agility); aviation (Emirates, Etihad, flydubai, Air Arabia, Qatar \
+Airways, Saudia, Riyadh Air, Gulf Air, Dnata); banks and exchanges (FAB, Emirates NBD, \
+ADCB, ADIB, Mashreq, QNB, Al Rajhi, SNB, NBK, Tadawul, ADX, DFM, Nasdaq Dubai, Tabby, \
+Tamara, Wio); real estate and giga-projects (Emaar, Aldar, Damac, Nakheel, Majid Al \
+Futtaim, Red Sea Global, NEOM, Qiddiya, Diriyah, Roshn, AlUla, Modon); telecom, consumer \
+and platforms (stc, e&, Etisalat, Ooredoo, Zain, Omantel, Careem, Talabat, Noon, Kitopi, \
+Property Finder, Anghami, Chalhoub, Lulu, Landmark); free zones and regulators (DIFC, \
+DMCC, ADGM, JAFZA, Masdar City, Monshaat, ADNEC, Expo City); sport, entertainment and \
+events used as investment vehicles (LIV Golf, Savvy Games, Surj Sports, SELA, FII, \
+Investopia, GITEX, LEAP).
+
+  2. A NAMED PRINCIPAL. The Gulf elite network is a beat in its own right, and these \
+moments often carry no business vocabulary at all — the photograph, the huddle, the box \
+at the final, the state visit. MBS / Mohammed bin Salman; MBZ / Mohamed bin Zayed; \
+Sheikh Tahnoun; Sheikh Mansour; Sheikh Khaled; Mohammed bin Rashid; Sheikh Hamdan; Yasir \
+Al-Rumayyan; Khaldoon Al Mubarak; Mohamed Alabbar; Amin Nasser; Sultan Al Jaber; \
+Abdulaziz bin Salman; Bin Sulayem; Sheikh Tamim. Also the offices: crown prince, energy \
+minister, finance minister, central bank governor, sovereign fund chief.
+
+  3. CONFLICT ECONOMICS — regional conflict priced as trade. The Strait of Hormuz, the \
+Red Sea, Bab el-Mandeb, Suez; blockades and chokepoints; rerouting and detours; war-risk \
+insurance and premiums; closed airspace and suspended flights; supply disruption, \
+shortages, force majeure; the commercial consequences of strikes, ceasefires, or the \
+Iran conflict.
+
+  4. GULF BUSINESS SUBSTANCE — acquisitions, stakes, IPOs and listings, funding rounds \
+and valuations, joint ventures and MoUs, tenders and contract awards, earnings and \
+guidance, sukuk and debt issuance, ratings, restructuring, AUM — attached to the region.
+
+CRITICAL FILTER: A Middle East place name on its own does NOT make a moment on-beat. \
+"Saudi Arabia arrests a cleric," an Egyptian election, a Gaza casualty figure, a Knesset \
+vote — these are regional politics, not The Circuit's beat, unless the moment also \
+carries capital, a named commercial entity, a named principal acting commercially, or \
+conflict economics. When in doubt, ask: would a reader who trades, invests in, or \
+operates in this region act on this?
+
+ALSO NOT on-beat: service journalism (prayer times, gold rates, visa how-tos), sport as \
+sport rather than as an investment vehicle, celebrity, and lifestyle."""
+
+
+SUMMARY_PROMPT = """You are analyzing a video transcript for a reporter at The Circuit, \
+a Gulf business publication.
+
+""" + BEAT_RUBRIC + """
+
+Your job is to surface the NOTABLE MOMENTS a Circuit editor would flag in Slack.
+
+What is NOT notable (skip):
+  - Pleasantries, thanks, generic opening/closing remarks
+  - Well-known positions restated in a routine way
+  - Process talk (\"we'll get to that later\", scheduling)
+  - Regional politics with no commercial, capital, or principal dimension
+
+Video: {title}
+
+TRANSCRIPT (with [MM:SS] timestamps):
+{transcript}
+
+Return a JSON array of UP TO 5 items, ordered most newsworthy first. Prefer four strong \
+on-beat moments over five where the fifth is filler — an off-beat item costs the channel \
+more than a missing one. Each item:
+{{
+  "headline": "news-headline-style one-liner packed with the specifics a Circuit editor would want at-a-glance",
+  "start_min": <int minute>,
+  "end_min": <int minute>,
+  "quote": "a direct verbatim pull-quote from the transcript, under 200 chars, or empty string if no clean one exists"
+}}
+
+Rules for the headline:
+  - Name specifics when it's reliable to do so — which fund, which company, which \
+principal, which country, which dollar amount, which stake percentage, which dates. If a \
+specific is clearly stated in the transcript, include it. If it isn't, don't invent one \
+and don't guess; leave it out or hedge honestly (e.g. "an unnamed Abu Dhabi fund", \
+"a sovereign investor").
+  - Lead with the money or the mover where there is one. A deal size, a stake, a \
+valuation, or a named principal is the most useful thing in the first five words.
+  - Active voice, claim-focused. Aim for 20-30 words if the specifics need it. \
+Do not sacrifice a reliable specific to hit a word count.
+  - No filler ("discusses", "talks about", "mentions") — go straight to what was said/claimed.
+  - Bracketed clarifier OK if extra context is needed, e.g. "(Mubadala's US tech arm)".
+
+Rules for the quote:
+  - Must appear VERBATIM in the transcript — do not paraphrase, condense, or clean up.
+  - Under 200 chars. If no clean stand-alone pull-quote exists, empty string.
+
+Other:
+  - If there are truly no on-beat moments, return []. An empty result is the correct \
+answer for a video that is not about this region's business.
+  - Return ONLY the JSON array. No markdown fences, no explanation.
+"""
+
+
+# ── Slack ──────────────────────────────────────────────────────────────────────
+
+class Slack:
+    def __init__(self):
+        self.token = os.environ.get("SLACK_BOT_TOKEN")
+        self.channel = os.environ.get("SLACK_CHANNEL_ID")
+
+    def _call(self, method, params=None, json_body=None):
+        url = f"https://slack.com/api/{method}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if json_body is not None:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+            r = requests.post(url, headers=headers, json=json_body, timeout=20)
+        else:
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Slack {method} error: {data.get('error')}")
+        return data
+
+    def history(self, oldest):
+        return self._call("conversations.history", params={
+            "channel": self.channel,
+            "oldest": oldest,
+            "limit": 200,
+            "inclusive": "false",
+        })
+
+    def thread_has_bot_reply(self, thread_ts, bot_user_id=None):
+        """Return True if this bot (or any bot) has already replied in-thread.
+        Belt-and-suspenders check to prevent duplicate summaries from state-race
+        conditions between workflow runs."""
+        try:
+            r = self._call("conversations.replies", params={
+                "channel": self.channel,
+                "ts": thread_ts,
+                "limit": 20,
+            })
+        except Exception:
+            return False  # on error, don't block posting
+        # Skip the parent message (index 0); any reply from us or another bot counts.
+        for m in r.get("messages", [])[1:]:
+            if bot_user_id and m.get("user") == bot_user_id:
+                return True
+            if m.get("bot_id"):
+                return True
+        return False
+
+    def post_reply(self, thread_ts, text, broadcast=False):
+        # broadcast=True: also surface the message in the main channel feed
+        # (used for real summaries). broadcast=False: quiet thread-only reply
+        # (used for "couldn't summarize" / "not supported" notices so they
+        # don't clutter the channel).
+        return self._call("chat.postMessage", json_body={
+            "channel": self.channel,
+            "thread_ts": thread_ts,
+            "reply_broadcast": broadcast,
+            "text": text,
+            "unfurl_links": False,
+            "unfurl_media": False,
+        })
+
+    def whoami(self):
+        return self._call("auth.test")
+
+
+# ── YouTube ────────────────────────────────────────────────────────────────────
+
+def yt_title(video_id):
+    """No-auth title fetch via oEmbed. Returns 'video' on failure."""
+    try:
+        r = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://youtu.be/{video_id}", "format": "json"},
+            timeout=10,
+        )
+        if r.ok:
+            return r.json().get("title", "video")
+    except Exception:
+        pass
+    return "video"
+
+
+def yt_transcript_via_ioapi(video_id):
+    """Cloud-native YouTube transcript via youtube-transcript.io API. Free tier
+    is 25/day, no residential IP required. Returns ({segments}, title, error).
+
+    Used as the primary YouTube path when YT_TRANSCRIPT_IO_TOKEN is set —
+    ClipMaker on the Mac is fallback (residential IP, no daily cap)."""
+    token = os.environ.get("YT_TRANSCRIPT_IO_TOKEN") or ""
+    if not token:
+        return None, None, "YT_TRANSCRIPT_IO_TOKEN is not set"
+
+    try:
+        r = requests.post(
+            "https://www.youtube-transcript.io/api/transcripts",
+            headers={
+                "Authorization": f"Basic {token}",
+                "Content-Type": "application/json",
+            },
+            json={"ids": [video_id]},
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as e:
+        return None, None, f"youtube-transcript.io unreachable ({type(e).__name__})"
+
+    if r.status_code == 401:
+        return None, None, "youtube-transcript.io rejected the token"
+    if r.status_code == 429:
+        return None, None, "youtube-transcript.io daily quota hit (25/day free)"
+    if not r.ok:
+        return None, None, f"youtube-transcript.io HTTP {r.status_code}: {r.text[:200]}"
+
+    try:
+        data = r.json()
+    except ValueError:
+        return None, None, "youtube-transcript.io returned non-JSON"
+
+    if not isinstance(data, list) or not data:
+        return None, None, "youtube-transcript.io returned empty result"
+
+    item = data[0]
+    title = (item.get("title") or "video").strip()
+
+    # Pick the English track; fall back to first available track.
+    tracks = item.get("tracks") or []
+    if not tracks:
+        return None, None, "no transcript tracks available"
+    en_track = next(
+        (t for t in tracks if (t.get("language") or "").lower().startswith("english")),
+        tracks[0],
+    )
+    raw_segments = en_track.get("transcript") or []
+    if not raw_segments:
+        return None, None, "transcript track has no segments"
+
+    segments = []
+    for s in raw_segments:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(s.get("start", 0) or 0)
+            duration = float(s.get("dur", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        segments.append({"text": text, "start": start, "duration": duration})
+
+    if not segments:
+        return None, None, "no usable transcript segments"
+    return segments, title, None
+
+
+def yt_transcript_via_clipmaker(url):
+    """Fetch YouTube transcript by POSTing to ClipMaker's /api/transcript on the
+    user's Mac (exposed via a public tunnel). Bot lives in GH Actions cloud where
+    YouTube blocks yt-dlp; ClipMaker on the Mac uses a residential IP and works
+    reliably. Returns ({segments}, title, error).
+    """
+    base = os.environ.get("CLIPMAKER_URL", "").rstrip("/")
+    if not base:
+        return None, None, "CLIPMAKER_URL is not set"
+    token = os.environ.get("CLIPMAKER_AUTH_TOKEN") or ""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = requests.post(f"{base}/api/transcript",
+                          headers=headers, json={"url": url}, timeout=200)
+    except requests.exceptions.RequestException as e:
+        return None, None, f"ClipMaker unreachable — is your Mac on and the tunnel running? ({type(e).__name__})"
+
+    if r.status_code == 401:
+        return None, None, "ClipMaker rejected the auth token"
+    if r.status_code >= 500:
+        try:
+            msg = r.json().get("error", r.text[:200])
+        except Exception:
+            msg = r.text[:200]
+        return None, None, f"ClipMaker error: {msg}"
+    if not r.ok:
+        return None, None, f"HTTP {r.status_code}: {r.text[:200]}"
+
+    data = r.json()
+    return data.get("segments") or [], data.get("title") or "video", None
+
+
+def resolve_spotify_to_mp3(spotify_url):
+    """Turn a Spotify episode URL into a public MP3 URL by resolving the
+    episode's show → iTunes Search → RSS feed → fuzzy-match the episode title.
+
+    Spotify audio is DRM-protected so yt-dlp can't touch it, but nearly every
+    podcast on Spotify also ships a public RSS feed with unprotected MP3
+    enclosures. Returns (mp3_url, show, episode_title, err).
+    """
+    import feedparser
+    from rapidfuzz import fuzz
+    from urllib.parse import quote_plus
+
+    m = re.search(r"episode/([A-Za-z0-9]+)", spotify_url)
+    if not m:
+        return None, None, None, "not a Spotify episode URL"
+    ep_id = m.group(1)
+
+    # 1. oembed → clean episode title
+    try:
+        oe = requests.get(
+            f"https://open.spotify.com/oembed?url=https://open.spotify.com/episode/{ep_id}",
+            timeout=15,
+        ).json()
+        ep_title = (oe.get("title") or "").strip()
+    except Exception as e:
+        return None, None, None, f"Spotify oembed failed: {type(e).__name__}"
+    if not ep_title:
+        return None, None, None, "Spotify oembed returned no title"
+
+    # 2. Scrape HTML → show name (JSON-LD partOfSeries.name, fallback og:description)
+    show = None
+    try:
+        html = requests.get(
+            f"https://open.spotify.com/episode/{ep_id}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+        ).text
+        for blob in re.findall(r'<script type="application/ld\+json">(.+?)</script>', html, re.S):
+            try:
+                data = json.loads(blob)
+                candidate = (data.get("partOfSeries") or {}).get("name")
+                if candidate:
+                    show = candidate.strip()
+                    break
+            except Exception:
+                pass
+        if not show:
+            og = re.search(r'<meta property="og:description" content="([^"]+)"', html)
+            if og:
+                show = og.group(1).split("·")[0].strip()
+    except Exception:
+        pass
+    if not show:
+        return None, None, ep_title, "couldn't find show name on Spotify episode page"
+
+    # 3. iTunes Search → feedUrl
+    try:
+        it = requests.get(
+            f"https://itunes.apple.com/search?entity=podcast&limit=5&term={quote_plus(show)}",
+            timeout=15,
+        ).json()
+    except Exception as e:
+        return None, None, ep_title, f"iTunes lookup failed: {type(e).__name__}"
+    results = it.get("results") or []
+    if not results:
+        return None, show, ep_title, f"no public RSS feed for '{show}' (Spotify-exclusive?)"
+    feed_url = results[0].get("feedUrl")
+    if not feed_url:
+        return None, show, ep_title, "iTunes returned no feedUrl"
+
+    # 4. RSS → fuzzy-match episode title → MP3 enclosure
+    try:
+        feed = feedparser.parse(feed_url)
+    except Exception as e:
+        return None, show, ep_title, f"RSS parse failed: {type(e).__name__}"
+    if not feed.entries:
+        return None, show, ep_title, "RSS feed has no episodes"
+    best = max(feed.entries, key=lambda e: fuzz.token_set_ratio(ep_title, e.get("title", "")))
+    score = fuzz.token_set_ratio(ep_title, best.get("title", ""))
+    if score < 85:
+        return None, show, ep_title, f"no episode title match (best={score}: {best.get('title','')[:80]!r})"
+    encs = best.get("enclosures") or []
+    mp3_url = encs[0].get("href") if encs else None
+    if not mp3_url:
+        return None, show, ep_title, "matched episode has no MP3 enclosure"
+    return mp3_url, show, ep_title, None
+
+
+def resolve_apple_to_mp3(apple_url):
+    """Skip Apple's flaky /podcast/ page entirely. Extract podcast + episode
+    IDs from the URL, hit iTunes Search API twice (podcast → feedUrl; episode
+    → trackName), then fuzzy-match the RSS feed to the episode.
+
+    Apple Podcasts URLs look like:
+        https://podcasts.apple.com/us/podcast/<slug>/id<podcastId>?i=<trackId>
+
+    yt-dlp's ApplePodcasts extractor tries to scrape that page, which returns
+    HTTP 500 fairly often (seen 2026-08-10). Going through iTunes API + RSS
+    is more reliable and matches how Spotify is already handled.
+    Returns (mp3_url, show, episode_title, err).
+    """
+    import feedparser
+    from rapidfuzz import fuzz
+
+    pm = re.search(r"/id(\d+)", apple_url)
+    tm = re.search(r"[?&]i=(\d+)", apple_url)
+    if not pm:
+        return None, None, None, "couldn't parse podcast ID from Apple URL"
+    podcast_id = pm.group(1)
+    track_id = tm.group(1) if tm else None
+
+    # 1. iTunes lookup on podcast ID → feedUrl + show name
+    try:
+        r = requests.get(f"https://itunes.apple.com/lookup?id={podcast_id}", timeout=15).json()
+    except Exception as e:
+        return None, None, None, f"iTunes podcast lookup failed: {type(e).__name__}"
+    results = r.get("results") or []
+    if not results:
+        return None, None, None, f"iTunes has no podcast id={podcast_id}"
+    feed_url = results[0].get("feedUrl")
+    show = results[0].get("collectionName")
+    if not feed_url:
+        return None, show, None, "iTunes returned no feedUrl for podcast"
+
+    # 2. iTunes lookup on track ID → episode title (for fuzzy match).
+    # Uses entity=podcastEpisode which surfaces trackName = actual episode title.
+    ep_title = None
+    if track_id:
+        try:
+            ep_r = requests.get(
+                f"https://itunes.apple.com/lookup?id={track_id}&entity=podcastEpisode",
+                timeout=15,
+            ).json()
+            for e in ep_r.get("results", []):
+                if e.get("kind") == "podcast-episode" or e.get("wrapperType") == "podcastEpisode":
+                    ep_title = (e.get("trackName") or "").strip() or None
+                    if ep_title:
+                        break
+        except Exception:
+            pass
+
+    # 3. RSS → fuzzy-match episode title → MP3 enclosure
+    try:
+        feed = feedparser.parse(feed_url)
+    except Exception as e:
+        return None, show, ep_title, f"RSS parse failed: {type(e).__name__}"
+    if not feed.entries:
+        return None, show, ep_title, "RSS feed has no episodes"
+
+    if ep_title:
+        best = max(feed.entries, key=lambda e: fuzz.token_set_ratio(ep_title, e.get("title", "")))
+        score = fuzz.token_set_ratio(ep_title, best.get("title", ""))
+        if score < 85:
+            return None, show, ep_title, f"no RSS episode matched Apple title (best={score}: {best.get('title','')[:80]!r})"
+    else:
+        # No trackId in URL → fall back to newest RSS entry.
+        best = feed.entries[0]
+        ep_title = best.get("title", "")
+
+    encs = best.get("enclosures") or []
+    mp3_url = encs[0].get("href") if encs else None
+    if not mp3_url:
+        return None, show, ep_title, "matched episode has no MP3 enclosure"
+    return mp3_url, show, ep_title, None
+
+
+def podcast_transcript_direct(url):
+    """Cloud-native podcast transcript: yt-dlp + ffmpeg + Groq Whisper — no Mac
+    needed. Spotify + Apple Podcasts URLs are resolved to their public RSS-feed
+    MP3 first (Spotify: DRM; Apple: flaky /podcast/ page). Direct MP3s pass
+    through unchanged.
+    Returns ({segments}, title, error).
+    """
+    import glob
+    import subprocess
+    import tempfile
+
+    key = os.environ.get("GROQ_API_KEY") or ""
+    if not key:
+        return None, None, "GROQ_API_KEY is not set"
+
+    # Spotify: swap the DRM'd URL for the same episode's public RSS MP3.
+    # Apple: swap the flaky /podcast/ page for its RSS MP3 the same way.
+    resolved_title = None
+    fetch_url = url
+    if "open.spotify.com/episode" in url:
+        mp3_url, show, ep_title, err = resolve_spotify_to_mp3(url)
+        if err:
+            return None, None, f"Spotify resolve failed: {err}"
+        fetch_url = mp3_url
+        resolved_title = f"{show}: {ep_title}" if show else ep_title
+        print(f"  → Spotify resolved: {resolved_title}")
+    elif "podcasts.apple.com" in url:
+        mp3_url, show, ep_title, err = resolve_apple_to_mp3(url)
+        if err:
+            return None, None, f"Apple resolve failed: {err}"
+        fetch_url = mp3_url
+        resolved_title = f"{show}: {ep_title}" if show else ep_title
+        print(f"  → Apple resolved: {resolved_title}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_out = os.path.join(tmpdir, "raw.%(ext)s")
+        proc = subprocess.run(
+            ["yt-dlp", "-x", "-o", raw_out, "--", fetch_url],
+            capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            err_lines = (proc.stderr or "").strip().splitlines()
+            return None, None, f"yt-dlp failed: {err_lines[-1] if err_lines else 'unknown'}"
+
+        raw_files = glob.glob(os.path.join(tmpdir, "raw.*"))
+        if not raw_files:
+            return None, None, "no audio file produced"
+        raw_audio = raw_files[0]
+
+        audio_path = os.path.join(tmpdir, "audio.opus")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_audio,
+             "-vn", "-ac", "1", "-ar", "16000",
+             "-c:a", "libopus", "-b:a", "16k",
+             "-application", "voip", "-vbr", "on",
+             audio_path],
+            capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            err_lines = (proc.stderr or "").strip().splitlines()
+            return None, None, f"ffmpeg reencode failed: {err_lines[-1] if err_lines else 'unknown'}"
+
+        size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        if size_mb > 24:
+            return None, None, f"audio still too large after compression ({size_mb:.1f}MB)"
+
+        # Prefer the title we resolved from Spotify (has show + episode).
+        # Otherwise ask yt-dlp for the title of the raw audio URL.
+        title = resolved_title or "podcast"
+        if not resolved_title:
+            try:
+                tp = subprocess.run(
+                    ["yt-dlp", "--skip-download", "--print", "title", "--", url],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if tp.returncode == 0 and tp.stdout.strip():
+                    title = tp.stdout.strip().splitlines()[0]
+            except Exception:
+                pass
+
+        try:
+            with open(audio_path, "rb") as f:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    files={"file": (os.path.basename(audio_path), f, "audio/opus")},
+                    data={
+                        "model": "whisper-large-v3-turbo",
+                        "response_format": "verbose_json",
+                    },
+                    timeout=600,
+                )
+        except requests.exceptions.RequestException as e:
+            return None, None, f"Groq unreachable ({type(e).__name__})"
+
+        if r.status_code == 429:
+            return None, None, "Groq rate limited (free-tier daily cap)"
+        if not r.ok:
+            return None, None, f"Groq HTTP {r.status_code}: {r.text[:200]}"
+
+        try:
+            groq_data = r.json()
+        except ValueError:
+            return None, None, "Groq returned non-JSON"
+
+        segments = []
+        for seg in groq_data.get("segments", []) or []:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0) or 0)
+            end = float(seg.get("end", start) or start)
+            segments.append({"text": text, "start": start, "duration": max(0.1, end - start)})
+
+    return segments, title, None
+
+
+def podcast_transcript_via_clipmaker(url):
+    """Fetch podcast audio transcript by POSTing to ClipMaker's
+    /api/podcast-transcript on the user's Mac. ClipMaker downloads the audio
+    via yt-dlp and transcribes it with Groq's free Whisper endpoint. Returns
+    ({segments}, title, error)."""
+    base = os.environ.get("CLIPMAKER_URL", "").rstrip("/")
+    if not base:
+        return None, None, "CLIPMAKER_URL is not set"
+    token = os.environ.get("CLIPMAKER_AUTH_TOKEN") or ""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        # Longer timeout — Whisper on a 60-min podcast can take ~30-60 sec.
+        r = requests.post(f"{base}/api/podcast-transcript",
+                          headers=headers, json={"url": url}, timeout=900)
+    except requests.exceptions.RequestException as e:
+        return None, None, f"ClipMaker unreachable — is your Mac on and the tunnel running? ({type(e).__name__})"
+
+    if r.status_code == 401:
+        return None, None, "ClipMaker rejected the auth token"
+    if r.status_code == 429:
+        return None, None, "Groq rate limited (free-tier daily cap likely hit)"
+    if r.status_code >= 500:
+        try:
+            msg = r.json().get("error", r.text[:200])
+        except Exception:
+            msg = r.text[:200]
+        return None, None, f"ClipMaker error: {msg}"
+    if not r.ok:
+        return None, None, f"HTTP {r.status_code}: {r.text[:200]}"
+
+    data = r.json()
+    return data.get("segments") or [], data.get("title") or "podcast", None
+
+
+# ── Twitter/X ──────────────────────────────────────────────────────────────────
+
+def fetch_tweet(url):
+    """Fetch a tweet's text + author via Twitter's public oembed API.
+
+    Returns {"text", "author_name", "author_handle", "has_video"} or None on
+    failure (deleted / protected / suspended).
+    """
+    try:
+        r = requests.get(
+            "https://publish.twitter.com/oembed",
+            params={"url": url, "omit_script": "true", "hide_thread": "true",
+                    "dnt": "true"},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        # Network-level failure — TransientError so we retry next tick.
+        raise TransientError(f"tweet fetch network error: {type(e).__name__}")
+
+    # 404 = tweet deleted / protected / suspended (permanent).
+    if r.status_code == 404:
+        return None
+    # Transient upstream failures — 429 rate limit, 5xx — retry later.
+    if r.status_code == 429 or r.status_code >= 500:
+        raise TransientError(f"tweet fetch HTTP {r.status_code}")
+    if not r.ok:
+        print(f"  ! tweet fetch failed HTTP {r.status_code}", file=sys.stderr)
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+
+    html_body = data.get("html", "")
+    # oembed HTML: <blockquote><p>tweet text with <a>links</a></p>&mdash; Author ...</blockquote>
+    from html import unescape
+    p_match = re.search(r"<p[^>]*>(.*?)</p>", html_body, re.DOTALL)
+    if not p_match:
+        return None
+    text = re.sub(r"<[^>]+>", " ", p_match.group(1))
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Detect embedded video via the pic.twitter.com marker in the raw HTML.
+    # Cheap heuristic — oembed doesn't tell us the media type directly.
+    has_video = "video.twimg.com" in html_body or "video/" in html_body.lower()
+
+    author_name = data.get("author_name", "").strip()
+    author_url = data.get("author_url", "") or ""
+    handle_match = re.search(r"(?:twitter\.com|x\.com)/([^/]+)/?$", author_url)
+    author_handle = handle_match.group(1) if handle_match else ""
+
+    return {
+        "text": text,
+        "author_name": author_name,
+        "author_handle": author_handle,
+        "has_video": has_video,
+    }
+
+
+TWEET_PROMPT = """You are analyzing a single tweet for a reporter at The Circuit, a Gulf \
+business publication.
+
+""" + BEAT_RUBRIC + """
+
+Tweet author: {author}
+Tweet text: {text}
+
+Judge whether this tweet is news-making from The Circuit's editorial angle. News-making means:
+  - A specific deal, stake, valuation, mandate, or capital commitment
+  - A named commercial entity or named principal doing something commercially consequential
+  - Conflict economics — a chokepoint, a rerouting, a war-risk repricing, closed airspace
+  - A scoop, revelation, or first-time-said remark about regional capital
+  - A quotable pull-quote from a principal, fund executive, or operator The Circuit covers
+
+NOT news-making:
+  - Regional politics, war coverage, or diplomacy with no commercial dimension
+  - Retweets with no added claim, generic snark, unrelated topics
+  - Pleasantries, self-promotion, personal life posts
+  - Service journalism, sport-as-sport, celebrity, lifestyle
+
+Return ONE JSON object:
+{{
+  "news_making": true/false,
+  "headline": "news-headline-style one-liner, action/claim-focused, 15 words max. \
+Lead with the money or the mover. Empty string if not news-making.",
+  "why": "one short sentence on what makes this news for The Circuit, or why it isn't."
+}}
+
+Return ONLY the JSON object. No markdown fences.
+"""
+
+
+def summarize_tweet(tweet):
+    author = tweet["author_name"]
+    if tweet["author_handle"]:
+        author = f"{author} (@{tweet['author_handle']})"
+    prompt = TWEET_PROMPT.format(author=author, text=tweet["text"])
+    response = _gemini_generate_with_retry(prompt, max_tokens=512)
+    raw = (response.text or "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+        return json.loads(raw)
+
+
+def build_tweet_reply(tweet, verdict):
+    author = tweet["author_name"] or "unknown author"
+    handle = f" (@{tweet['author_handle']})" if tweet["author_handle"] else ""
+    header = f"*Tweet from {_esc(author)}{_esc(handle)}*"
+    tweet_quoted = "\n".join(f"> {_esc(line)}" for line in tweet["text"].split("\n"))
+
+    if not verdict.get("news_making"):
+        why = str(verdict.get("why", "")).strip()
+        body = f"_Not obviously news-making — {_esc(why)}_" if why else "_Not obviously news-making._"
+        return f"{header}\n\n{tweet_quoted}\n\n{body}"
+
+    headline = _esc(str(verdict.get("headline", "")).strip())
+    return f"{header}\n\n📌 {headline}\n\n{tweet_quoted}"
+
+
+# ── YouTube helpers (continued) ────────────────────────────────────────────────
+
+def format_transcript_for_llm(segments):
+    """Convert transcript segments into timestamped lines for the LLM."""
+    lines = []
+    for seg in segments:
+        start = int(seg["start"])
+        m, s = start // 60, start % 60
+        text = seg["text"].replace("\n", " ").strip()
+        if text:
+            lines.append(f"[{m:02d}:{s:02d}] {text}")
+    return "\n".join(lines)
+
+
+# ── Gemini summarizer ──────────────────────────────────────────────────────────
+
+def _gemini_generate_with_retry(prompt, max_tokens=8192):
+    """Call Gemini with retries + model fallback. Gemini's 'flash-latest' can
+    hit 503 UNAVAILABLE (high demand). We retry with backoff, and if the fast
+    model keeps failing, fall back to a lite variant."""
+    from google import genai
+    from google.genai import types as gtypes
+    from google.genai import errors as gerrors
+
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    client = genai.Client(api_key=key)
+
+    # Order: main model, then a lite fallback that's usually less contended.
+    models = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+    config = gtypes.GenerateContentConfig(
+        response_mime_type="application/json",
+        max_output_tokens=max_tokens,
+    )
+
+    # httpx network errors bubble up from google-genai's HTTP client (e.g.
+    # RemoteProtocolError when Google's server drops the connection mid-response).
+    # These are transient and worth retrying — same treatment as ServerError.
+    import httpx
+
+    last_err = None
+    for model in models:
+        for attempt in range(3):
+            try:
+                return client.models.generate_content(
+                    model=model, contents=prompt, config=config,
+                )
+            except gerrors.ClientError as e:
+                # 4xx from Gemini — safety filter, malformed prompt, context
+                # too long, wrong permission. Retrying won't help. Raise
+                # immediately so the caller can mark this URL permanently done.
+                raise
+            except (gerrors.ServerError, httpx.RemoteProtocolError,
+                    httpx.ReadTimeout, httpx.ConnectError,
+                    httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+                last_err = e
+                # Sleep 4s, 12s before the next attempt within the same model.
+                if attempt < 2:
+                    time.sleep(4 * (attempt * 2 + 1))
+                    continue
+                # Otherwise fall through to the next model.
+                break
+    # If we're here, everything failed — surface as TransientError so the
+    # caller retries next tick instead of marking permanently done.
+    if last_err and not isinstance(last_err, gerrors.ClientError):
+        raise TransientError(f"Gemini transient after retries: {type(last_err).__name__}: {last_err}")
+    raise last_err if last_err else RuntimeError("Gemini call failed for unknown reason")
+
+
+def summarize(transcript_text, video_title):
+    prompt = SUMMARY_PROMPT.format(title=video_title, transcript=transcript_text)
+    response = _gemini_generate_with_retry(prompt, max_tokens=4096)
+    raw = (response.text or "").strip()
+    try:
+        moments = json.loads(raw)
+    except json.JSONDecodeError:
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+        moments = json.loads(raw)
+    if not isinstance(moments, list):
+        return []
+    return moments
+
+
+# ── Article fetch + summary ────────────────────────────────────────────────────
+
+ARTICLE_PROMPT = """You are analyzing a news article for a reporter at The Circuit, a Gulf \
+business publication. Surface the NOTABLE POINTS a Circuit editor would flag in Slack.
+
+""" + BEAT_RUBRIC + """
+
+Article title: {title}
+
+ARTICLE TEXT:
+{text}
+
+Return a JSON array of UP TO 5 items, ordered most newsworthy first. Prefer four strong \
+on-beat points over five where the fifth is filler. Each item:
+{{
+  "headline": "news-headline-style one-liner packed with specifics a Circuit editor would want at-a-glance",
+  "quote": "a direct verbatim pull-quote from the article, under 200 chars, or empty string if no clean one exists"
+}}
+
+Rules for the headline:
+  - Name specifics when reliable — which fund, which company, which principal, which \
+country, which dollar amount, which stake percentage, which dates. If a specific is \
+clearly stated in the article, include it. If it isn't, don't invent one; leave it out \
+or hedge honestly.
+  - Lead with the money or the mover where there is one.
+  - Active voice, claim-focused. 20-30 words if specifics need it. No filler.
+
+Rules for the quote:
+  - Must appear VERBATIM in the article text — do not paraphrase or clean up.
+  - Under 200 chars. Empty string if no clean pull-quote exists.
+
+If there are truly no on-beat points, return []. An empty result is the correct answer \
+for an article that is not about this region's business.
+Return ONLY the JSON array. No markdown fences.
+"""
+
+
+# Curated User-Agent — real Chrome string, less likely to be blocked than a bare requests default.
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+
+def fetch_article(url):
+    """Fetch and extract article text. Returns {"title", "text"} or None.
+
+    Works well for most news sites (CNN, AP, Politico, Axios, etc.). Fails on
+    aggressive paywalls (NYTimes, WaPo, WSJ) that require auth cookies.
+    """
+    try:
+        import trafilatura
+    except ImportError:
+        print("  ! trafilatura not installed", file=sys.stderr)
+        return None
+
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": _BROWSER_UA,
+                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                     "Accept-Language": "en-US,en;q=0.9"},
+            timeout=25,
+            allow_redirects=True,
+        )
+    except requests.exceptions.RequestException as e:
+        # Network-level failure (DNS, TLS, timeout, connection reset) — retry.
+        raise TransientError(f"article fetch network error: {type(e).__name__}")
+
+    # Transient upstream — retry.
+    if r.status_code == 429 or r.status_code >= 500:
+        raise TransientError(f"article fetch HTTP {r.status_code}")
+    # Permanent — 4xx that isn't rate-limit (403 paywall, 404 gone).
+    if r.status_code >= 400:
+        print(f"  ! article fetch HTTP {r.status_code}", file=sys.stderr)
+        return None
+
+    try:
+        extracted = trafilatura.extract(
+            r.text, output_format="json", with_metadata=True,
+        )
+    except Exception as e:
+        print(f"  ! trafilatura extract failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    if not extracted:
+        return None
+    try:
+        data = json.loads(extracted)
+    except json.JSONDecodeError:
+        return None
+    text = (data.get("text") or "").strip()
+    if len(text) < 300:
+        # Anything shorter than ~300 chars is almost certainly a paywall stub
+        # or a "please enable JS" placeholder — not a real article.
+        return None
+    return {"title": (data.get("title") or "").strip(), "text": text}
+
+
+def summarize_article(text, article_title):
+    prompt = ARTICLE_PROMPT.format(title=article_title, text=text[:60000])
+    response = _gemini_generate_with_retry(prompt, max_tokens=4096)
+    raw = (response.text or "").strip()
+    try:
+        moments = json.loads(raw)
+    except json.JSONDecodeError:
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+        moments = json.loads(raw)
+    if not isinstance(moments, list):
+        return []
+    return moments
+
+
+def build_article_reply(title, url, moments):
+    if not moments:
+        return f"Scanned *{_esc(title)}* — no clearly news-making points jumped out."
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc.replace("www.", "")
+    lines = [f"*Notable Points from “{_esc(title)}”* _({_esc(host)})_", ""]
+    for i, m in enumerate(moments, 1):
+        headline = _esc(str(m.get("headline", "")).strip())
+        lines.append(f"{i}. *{headline}*")
+        quote = str(m.get("quote", "")).strip()
+        if quote:
+            lines.append(f"    • “{_esc(quote)}”")
+        lines.append("")  # blank line between clips for readability
+    return "\n".join(lines).rstrip() + "\n".rstrip() + "\n"
+
+
+# ── Reply formatting ───────────────────────────────────────────────────────────
+
+def build_reply(title, moments):
+    if not moments:
+        return f"Scanned *{_esc(title)}* — no clearly news-making moments jumped out."
+    lines = [f"*Notable Moments from “{_esc(title)}”*", ""]
+    for i, m in enumerate(moments, 1):
+        s = int(m.get("start_min", 0))
+        e = int(m.get("end_min", s))
+        rng = f"{s}min" if s == e else f"{s}-{e}min"
+        headline = _esc(str(m.get("headline", "")).strip())
+        lines.append(f"{i}. *{headline}* ({rng})")
+        quote = str(m.get("quote", "")).strip()
+        if quote:
+            lines.append(f"    • “{_esc(quote)}”")
+        lines.append("")  # blank line between clips for readability
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _esc(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ── State ──────────────────────────────────────────────────────────────────────
+
+def load_state():
+    """Load watcher state, or return a fresh baseline. If the file EXISTS but
+    is corrupt, back it up and fail loudly — silently resetting to first-run
+    baseline would silently drop every URL from the last hour."""
+    if not STATE_FILE.exists():
+        return {"last_ts": None, "processed_ts": []}
+    try:
+        raw = STATE_FILE.read_text()
+        return json.loads(raw)
+    except Exception as e:
+        # Preserve the corrupt file for post-mortem, then bail hard so the
+        # workflow's Slack failure-alert fires.
+        try:
+            backup = STATE_FILE.with_suffix(".corrupt")
+            STATE_FILE.rename(backup)
+            print(f"  ! state file corrupt — moved to {backup}", file=sys.stderr)
+        except Exception:
+            pass
+        raise RuntimeError(f"watcher_state.json is corrupt: {type(e).__name__}: {e}")
+
+
+def save_state(state):
+    """Atomic write: tempfile in same dir + os.replace so a mid-write kill
+    can't leave a half-written file that load_state would choke on."""
+    import os as _os
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    _os.replace(tmp, STATE_FILE)
+
+
+# ── URL processing ─────────────────────────────────────────────────────────────
+
+class TransientError(Exception):
+    """Raised when a URL couldn't be processed for a reason that will likely
+    resolve itself (Mac off, tunnel down, Gemini overloaded, network hiccup).
+
+    Bubbles to the main loop, which does NOT advance the polling window past
+    the message — so it gets retried on the next tick.
+    """
+
+
+# Substrings that indicate a failure that will likely resolve on its own —
+# retry next tick instead of marking the message permanently done. Permanent
+# failures (e.g. "no captions" from ClipMaker) return 200 with an empty
+# segments list now, so they don't route through this classifier.
+_TRANSIENT_HINTS = (
+    "ClipMaker unreachable",
+    "ClipMaker rejected the auth token",
+    "CLIPMAKER_URL is not set",
+    "HTTP 5",                          # any 5xx from tunnel/ClipMaker/upstream
+    "ClipMaker error:",                # ClipMaker returned a real 5xx (rare)
+    "rate limited",                    # Groq / ioapi / etc. rate-limit strings
+    "quota",                           # daily-cap / quota-exhausted messages
+    "unreachable",                     # generic unreachable phrasing
+    "Network",                         # requests.RequestException
+    "Timeout",
+    "Connection",
+    "HTTP 429",                        # explicit 429 anywhere in the chain
+)
+
+
+def _is_transient(err_str):
+    if not err_str:
+        return False
+    lower = err_str.lower()
+    return any(h.lower() in lower for h in _TRANSIENT_HINTS)
+
+
+def process_url(url, dry_run=False, slack=None, thread_ts=None):
+    """Fetch transcript/tweet/article, summarize, post to Slack.
+
+    Returns (reply_or_none, is_summary):
+      - (reply, True)  → real summary, post + broadcast, mark processed
+      - (reply, False) → non-summary content (currently unused — nothing posts
+                         on failure per the "silent retry" behavior)
+      - (None, False)  → nothing to do (unsupported URL, or nothing news-making)
+
+    Raises TransientError if the bot literally couldn't run (Mac off, Gemini
+    503, etc.) — main loop retries next tick without posting anything.
+    """
+    yt_match = YOUTUBE_RE.search(url)
+    tweet_match = TWEET_RE.search(url)
+    pod_match = PODCAST_RE.search(url)
+    article_match = ARTICLE_RE.search(url) if not (yt_match or tweet_match or pod_match) else None
+
+    if yt_match:
+        video_id = yt_match.group(1)
+        print(f"  → YouTube video {video_id}")
+        # Primary: cloud-native via youtube-transcript.io (free tier 25/day,
+        # no Mac needed). Fallback: ClipMaker on Mac (residential IP, no cap).
+        segments, cm_title, err = yt_transcript_via_ioapi(video_id)
+        if err:
+            print(f"  → ioapi failed: {err} — falling back to Mac")
+            segments, cm_title, err = yt_transcript_via_clipmaker(url)
+            if err and _is_transient(err):
+                raise TransientError(f"YT transcript unreachable (both paths): {err}")
+        if err or not segments:
+            # Both paths gave a permanent-ish failure — video may have no
+            # captions, be region-locked, or removed. Skip silently.
+            print(f"  → no transcript (permanent): {err or 'no segments'}")
+            return None, False
+        title = cm_title if cm_title and cm_title != "video" else yt_title(video_id)
+        transcript_text = format_transcript_for_llm(segments)
+        print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
+        moments = summarize(transcript_text, title)
+        print(f"  → {len(moments)} notable moments")
+        if not moments:
+            return None, False
+        reply = build_reply(title, moments)
+        is_summary = True
+    elif tweet_match:
+        tweet_id = tweet_match.group(1)
+        print(f"  → Tweet {tweet_id}")
+        tweet = fetch_tweet(url)
+        if not tweet:
+            print("  → tweet fetch failed — deleted/protected/suspended (permanent)")
+            return None, False
+        # Video-only tweets: transcribe the video (yt-dlp handles X.com URLs)
+        # and summarize like a podcast/YouTube video into 5 Notable Moments.
+        if tweet["has_video"] and len(tweet["text"]) < 40:
+            print("  → video-only tweet — transcribing")
+            segments, _t, err = podcast_transcript_direct(url)
+            if err:
+                if _is_transient(err):
+                    raise TransientError(f"tweet video transient: {err}")
+                print(f"  → tweet video transcript failed (permanent): {err}")
+                return None, False
+            if not segments:
+                print("  → tweet video: no segments")
+                return None, False
+            handle = tweet["author_handle"] or "unknown"
+            author = tweet["author_name"] or handle
+            title = f"{author} (@{handle}) video tweet"
+            transcript_text = format_transcript_for_llm(segments)
+            print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
+            moments = summarize(transcript_text, title)
+            print(f"  → {len(moments)} notable moments")
+            if not moments:
+                return None, False
+            reply = build_reply(title, moments)
+            is_summary = True
+        else:
+            verdict = summarize_tweet(tweet)
+            print(f"  → news_making={verdict.get('news_making')}")
+            if not verdict.get("news_making"):
+                return None, False
+            reply = build_tweet_reply(tweet, verdict)
+            is_summary = True
+    elif article_match:
+        print(f"  → Article {url}")
+        article = fetch_article(url)
+        if not article:
+            # Paywall, JS-required site, extraction failure. Permanent skip.
+            print("  → article fetch/extract failed (paywall / permanent)")
+            return None, False
+        title = article["title"] or url
+        print(f"  → {len(article['text'])} chars of article text")
+        moments = summarize_article(article["text"], title)
+        print(f"  → {len(moments)} notable moments")
+        if not moments:
+            return None, False
+        reply = build_article_reply(title, url, moments)
+        is_summary = True
+    elif pod_match:
+        print(f"  → Podcast {url}")
+        # Try cloud-native first (no Mac needed). Fall back to ClipMaker on
+        # Mac if the direct path fails — usually because Groq is down or
+        # yt-dlp missing from the runner.
+        segments, pod_title, err = podcast_transcript_direct(url)
+        if err:
+            print(f"  → direct path failed: {err} — falling back to Mac")
+            segments, pod_title, err = podcast_transcript_via_clipmaker(url)
+            if err and _is_transient(err):
+                raise TransientError(f"Podcast transcript unreachable (both paths): {err}")
+        if err or not segments:
+            print(f"  → podcast transcript unavailable (permanent): {err or 'no segments'}")
+            return None, False
+        title = pod_title or "podcast"
+        transcript_text = format_transcript_for_llm(segments)
+        print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
+        moments = summarize(transcript_text, title)
+        print(f"  → {len(moments)} notable moments")
+        if not moments:
+            return None, False
+        reply = build_reply(title, moments)
+        is_summary = True
+    else:
+        return None, False
+
+    if dry_run or not slack:
+        print("--- REPLY ---")
+        print(reply)
+        print("-------------")
+    else:
+        slack.post_reply(thread_ts, reply, broadcast=is_summary)
+        print(f"  → posted reply in thread {thread_ts} (broadcast={is_summary})")
+    return reply, is_summary
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print replies instead of posting to Slack.")
+    parser.add_argument("--url", help="Process one URL and exit (implies --dry-run).")
+    parser.add_argument("--window-hours", type=int, default=None,
+                        help="Override baseline window on first run (default: 1 hour).")
+    args = parser.parse_args()
+
+    if args.url:
+        process_url(args.url, dry_run=True)
+        return
+
+    slack = Slack()
+    if not slack.token or not slack.channel:
+        sys.exit("Missing SLACK_BOT_TOKEN or SLACK_CHANNEL_ID.")
+    bot_user_id = slack.whoami().get("user_id")
+
+    state = load_state()
+    now = time.time()
+    baseline_window = (args.window_hours or 1) * 3600
+    since = state.get("last_ts") or f"{now - baseline_window:.6f}"
+    first_run = not state.get("last_ts")
+
+    print(f"Polling since ts={since} ({'first run baseline' if first_run else 'resume'})")
+    history = slack.history(since)
+
+    messages = history.get("messages", [])
+    print(f"  → {len(messages)} messages in window")
+
+    processed = set(state.get("processed_ts", []))
+    # Track the newest ts we can safely advance the polling window past.
+    # We only advance past a message if it's been fully handled (processed,
+    # baseline-skipped, or contains no URL we care about). If a message
+    # failed, `advanceable_ts` freezes at the previous value so next tick
+    # will re-fetch that message and retry.
+    advanceable_ts = float(since)
+    any_failed = False
+
+    # Slack returns newest-first — process oldest-first so replies land in order.
+    for msg in reversed(messages):
+        ts = msg["ts"]
+        ts_f = float(ts)
+        if ts in processed:
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+            continue
+        # Skip messages from the bot itself + other bots.
+        if msg.get("user") == bot_user_id or msg.get("bot_id"):
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+            continue
+        text = msg.get("text", "") or ""
+        # Slack encodes & / < / > in message text — decode so URL regexes match
+        # (e.g. `watch?app=desktop&amp;v=abc` needs to become `...&v=abc`).
+        from html import unescape as _unescape
+        text = _unescape(text)
+        if not (YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text) or ARTICLE_RE.search(text)):
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+            continue
+
+        # Baseline the very first run: mark as processed but don't post.
+        if first_run and not args.dry_run:
+            print(f"  (baseline) skip {ts}")
+            processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+            continue
+
+        # Belt-and-suspenders duplicate-prevention: if the bot already replied
+        # in this thread (from a prior workflow run whose state-commit lost a
+        # race, etc.), skip. Marks as processed so we don't keep re-checking.
+        if not args.dry_run and slack.thread_has_bot_reply(ts, bot_user_id):
+            print(f"  (already replied in-thread) skip {ts}")
+            processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+            continue
+
+        # First supported URL per message — one summary per post.
+        url_match = YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text) or ARTICLE_RE.search(text)
+        url = url_match.group(0).rstrip(_URL_TRAILING_JUNK)
+        print(f"[{ts}] processing: {url}")
+        try:
+            process_url(url, dry_run=args.dry_run, slack=slack, thread_ts=ts)
+            # Mark processed on both success AND permanent failure — bot did
+            # what it could, no point retrying (paywall won't unpaywall itself).
+            processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+        except TransientError as e:
+            print(f"  ! transient — will retry next tick: {e}", file=sys.stderr)
+            # Silent: no reply posted, ts not marked. Next tick fetches this
+            # message again and tries again. When your Mac / tunnel / Gemini
+            # comes back, the summary posts as if nothing happened.
+            any_failed = True
+        except Exception as e:
+            print(f"  ! unexpected failure: {type(e).__name__}: {e}", file=sys.stderr)
+            # Unknown deterministic error (Gemini 4xx, malformed JSON,
+            # AttributeError on unexpected LLM output, etc.). Retrying will
+            # produce the same failure and freeze the watermark. Mark as
+            # processed so we move on. The thread has no reply, matching the
+            # "silent skip on permanent failure" contract.
+            processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+
+    if not args.dry_run:
+        state["last_ts"] = f"{advanceable_ts:.6f}"
+        state["processed_ts"] = sorted(processed)[-500:]  # cap size
+        save_state(state)
+
+
+if __name__ == "__main__":
+    main()
