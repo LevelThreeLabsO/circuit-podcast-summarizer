@@ -1258,7 +1258,19 @@ def main():
     first_run = not state.get("last_ts")
 
     print(f"Polling since ts={since} ({'first run baseline' if first_run else 'resume'})")
-    history = slack.history(since)
+    try:
+        history = slack.history(since)
+    except RuntimeError as e:
+        # not_in_channel: the app is installed but nobody has run
+        # `/invite @podcastplusyoutubesum` yet. That is a setup step, not a
+        # fault — exit 0 with a clear instruction rather than turning the
+        # Actions tab red every 30 seconds until someone notices.
+        if "not_in_channel" in str(e):
+            print(f"Bot is not in channel {slack.channel} yet — "
+                  f"run `/invite @<bot name>` in that channel, then this "
+                  f"will start working on the next tick.")
+            return
+        raise
 
     messages = history.get("messages", [])
     print(f"  → {len(messages)} messages in window")
