@@ -876,8 +876,19 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
         raise RuntimeError("GEMINI_API_KEY is not set")
     client = genai.Client(api_key=key)
 
-    # Order: main model, then a lite fallback that's usually less contended.
-    models = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+    # Each entry is a separate 20/day bucket, so the list IS the daily budget.
+    # Circuit leads with 3-flash-preview; JI leads with a different model so the two
+    # bots don't drain the same bucket first. Order after the first entry is
+    # shared — by the time a bot is that deep, capacity matters more than
+    # politeness.
+    models = [
+        "gemini-3-flash-preview",
+        "gemini-3.6-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+    ]
     config = gtypes.GenerateContentConfig(
         response_mime_type="application/json",
         max_output_tokens=max_tokens,
@@ -889,6 +900,7 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
     import httpx
 
     last_err = None
+    exhausted = []
     for model in models:
         for attempt in range(3):
             try:
@@ -896,13 +908,25 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
                     model=model, contents=prompt, config=config,
                 )
             except gerrors.ClientError as e:
-                # 4xx from Gemini — safety filter, malformed prompt, context
-                # too long, wrong permission. Retrying won't help. Raise
-                # immediately so the caller can mark this URL permanently done.
+                msg = str(e)
+                if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                    # Quota, not a bad request. The free tier is metered per
+                    # project PER MODEL, so the next model in the list has its
+                    # own untouched bucket — moving on is the whole point of
+                    # having a list. Previously this raised immediately, which
+                    # made the fallback chain dead code the moment a daily
+                    # quota ran out (2026-09-22: every bot failed at once with
+                    # five usable models sitting unused behind the first).
+                    exhausted.append(model)
+                    last_err = e
+                    break
+                # Any other 4xx — safety filter, malformed prompt, context too
+                # long, wrong permission — is genuinely permanent. Retrying or
+                # switching models sends the same bad request.
                 raise
             except (gerrors.ServerError, httpx.RemoteProtocolError,
                     httpx.ReadTimeout, httpx.ConnectError,
-                    httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+                    httpx.ConnectTimeout) as e:
                 last_err = e
                 # Sleep 4s, 12s before the next attempt within the same model.
                 if attempt < 2:
@@ -910,11 +934,18 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
                     continue
                 # Otherwise fall through to the next model.
                 break
-    # If we're here, everything failed — surface as TransientError so the
-    # caller retries next tick instead of marking permanently done.
-    if last_err and not isinstance(last_err, gerrors.ClientError):
-        raise TransientError(f"Gemini transient after retries: {type(last_err).__name__}: {last_err}")
-    raise last_err if last_err else RuntimeError("Gemini call failed for unknown reason")
+
+    # Everything failed. Surface as TransientError either way so the caller
+    # retries on a later tick rather than marking the URL permanently done —
+    # an exhausted daily quota refills, and a silently dropped link never comes
+    # back. This is the same class of bug as the 405 misclassification.
+    if exhausted:
+        raise TransientError(
+            f"Gemini daily quota exhausted on {len(exhausted)} model(s): "
+            f"{', '.join(exhausted)} — will retry when quota resets")
+    raise TransientError(
+        f"Gemini transient after retries: {type(last_err).__name__}: {last_err}"
+        if last_err else "Gemini call failed for unknown reason")
 
 
 def summarize(transcript_text, video_title):
